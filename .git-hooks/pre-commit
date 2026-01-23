@@ -1,0 +1,38 @@
+#!/bin/bash
+# Git pre-commit hook to prevent committing large files
+# This helps ensure model files don't exceed the 25MB evaluation system limit
+#
+# To install this hook, run:
+#   chmod +x .git-hooks/pre-commit
+#   git config core.hooksPath .git-hooks
+#
+# To bypass this check (not recommended), use:
+#   git commit --no-verify
+
+MAX_SIZE_MB=25
+MAX_SIZE_BYTES=$((MAX_SIZE_MB * 1024 * 1024))
+
+# Check all files being committed
+while IFS= read -r -d '' file; do
+    # Get file size
+    if [ -f "$file" ]; then
+        size=$(wc -c < "$file")
+        
+        if [ "$size" -gt "$MAX_SIZE_BYTES" ]; then
+            size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+            echo "❌ Error: File '$file' is ${size_mb}MB (max: ${MAX_SIZE_MB}MB)"
+            echo ""
+            echo "This file exceeds the evaluation system's size limit."
+            echo "Consider:"
+            echo "  - Model compression or quantization"
+            echo "  - Reducing model parameters"
+            echo "  - Pruning unnecessary layers"
+            echo ""
+            echo "To bypass this check (not recommended): git commit --no-verify"
+            exit 1
+        fi
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+exit 0
+
