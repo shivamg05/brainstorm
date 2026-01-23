@@ -4,9 +4,11 @@
 
 This project implements a neural decoder for real-time auditory stimulus classification from ECoG (electrocorticography) recordings. The goal is to predict sound frequency (Hz) or silence at every timestep from a 1024-channel micro-ECoG array.
 
-## Current Best Model: EEG-TCNet
+## Current Best Model: EEG-TCNet Spectral
 
-**Score: 61.1/100** | Accuracy: 48.6% | Latency: 35ms | Size: 257KB
+**Score: 64.9/100** | Accuracy: 57.9% | Latency: 55ms | Size: 108KB
+
+This model extends EEG-TCNet with causal spectral feature extraction, focusing on high-gamma band power (70-150 Hz) which is most informative for ECoG decoding.
 
 ### Architecture
 
@@ -94,7 +96,8 @@ Input: (batch, seq_len, 1024 channels)
 |-------|----------|-----|------|-------------|
 | MLP Baseline | 33.8% (16.9 pts) | 65ms (11.5 pts) | 1.01MB (11.1 pts) | **39.5** |
 | EEG-TCNet v1 | 39.6% (19.8 pts) | 42ms (15.1 pts) | 104KB (23.0 pts) | **58.0** |
-| **EEG-TCNet v2** | **48.6%** (24.3 pts) | **35ms** (16.4 pts) | **257KB** (20.4 pts) | **61.1** |
+| EEG-TCNet v2 | 48.6% (24.3 pts) | 35ms (16.4 pts) | 257KB (20.4 pts) | **61.1** |
+| **EEG-TCNet Spectral** | **57.9%** (28.9 pts) | **55ms** (13.0 pts) | **108KB** (23.0 pts) | **64.9** |
 
 ### Score Breakdown
 
@@ -207,7 +210,9 @@ brainstorm/
 │   ├── base.py              # Abstract base class (DO NOT MODIFY)
 │   ├── mlp.py               # Simple MLP baseline
 │   ├── logistic_regression.py
-│   ├── eeg_tcnet.py         # Current best model
+│   ├── eeg_tcnet.py         # EEG-TCNet model
+│   ├── eeg_tcnet_spectral.py # Current best model (with spectral features)
+│   ├── preprocessing.py     # Causal spectral preprocessing
 │   └── metrics.py           # Evaluation metrics (DO NOT MODIFY)
 ├── evaluation.py            # Model evaluation (DO NOT MODIFY)
 └── ...
@@ -222,29 +227,29 @@ model_metadata.json          # Model path and class info
 
 ### Training
 ```python
-from brainstorm.ml.eeg_tcnet import EEGTCNet
+from brainstorm.ml.eeg_tcnet_spectral import EEGTCNetSpectral
 from brainstorm.loading import load_raw_data
 
 train_features, train_labels = load_raw_data("./data", step="train")
 
-model = EEGTCNet(
-    F1=16, D=2, F2=32,
-    tcn_channels=32, tcn_layers=3,
-    dropout=0.4, context_window=128
+model = EEGTCNetSpectral(
+    n_channels=train_features.shape[1],
+    context_window=64,
 )
 
 model.fit(
     X=train_features.values,
     y=train_labels["label"].values,
-    epochs=40,
+    epochs=30,
     batch_size=32,
-    seq_len=128
+    seq_len=64,
+    learning_rate=1e-3,
 )
 ```
 
 ### Inference
 ```python
-model = EEGTCNet.load()
+model = EEGTCNetSpectral.load()
 prediction = model.predict(sample)  # sample shape: (1024,)
 ```
 
@@ -262,7 +267,7 @@ prediction = model.predict(sample)  # sample shape: (1024,)
 
 ## Next Steps
 
-1. **Immediate**: Implement high-gamma band power extraction (70-150 Hz)
+1. ~~**Immediate**: Implement high-gamma band power extraction (70-150 Hz)~~ **DONE** - Implemented in EEGTCNetSpectral
 2. **Short-term**: Channel selection based on mutual information
 3. **Medium-term**: Experiment with larger temporal context
 4. **If needed**: Model compression via quantization

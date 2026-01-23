@@ -1,4 +1,4 @@
 {
   "model_path": "model.pt",
-  "import_string": "brainstorm.ml.eeg_tcnet.EEGTCNet"
+  "import_string": "brainstorm.ml.eeg_tcnet_spectral.EEGTCNetSpectral"
 }
