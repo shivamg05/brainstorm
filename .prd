@@ -1,0 +1,391 @@
+# BrainStorm 2026 - Track 1: Neural Decoder Development Plan
+
+## Challenge Overview
+
+### Problem Statement
+Build a neural decoder that is accurate, fast, and lightweight for real-time auditory stimulus classification from ECoG recordings. The model must run on edge devices with strict power, memory, and compute constraints.
+
+### Task
+- **Streaming classification**: Predict sound frequency (Hz) or silence (0 Hz) at every timestep
+- **Data source**: 1024-channel micro-ECoG array from auditory cortex (swine model)
+- **Sampling rate**: 1000 Hz (1ms per sample)
+- **Constraint**: Causal inference only (no future data)
+
+### Scoring (0-100 scale)
+
+| Weight | Metric | Description | Formula |
+|--------|--------|-------------|---------|
+| **50%** | Balanced Accuracy | Primary metric, weighted by class frequency | `accuracy × 50` |
+| **25%** | Prediction Lag | Time delay until correct classification | `exp(-6 × lag_ms/500) × 25` |
+| **25%** | Model Size | Size on disk (≤25MB hard limit) | `exp(-4 × size_mb/5) × 25` |
+
+### Scoring Insights
+- **Lag**: 10ms → ~22pts, 50ms → ~14pts, 100ms → ~8pts, 500ms → ~0pts
+- **Size**: 0.5MB → ~17pts, 1MB → ~11pts, 5MB → ~0.5pts
+
+---
+
+## Current State Analysis
+
+### Existing Implementations
+1. **MLP** (`brainstorm/ml/mlp.py`): Single hidden layer MLP
+2. **LogisticRegression** (`brainstorm/ml/logistic_regression.py`): Sklearn with optional PCA
+
+### Data Characteristics
+- **Features**: Raw voltage (n_samples, 1024), no preprocessing applied
+- **Labels**: Integer frequency in Hz (0 = silence, >0 = tone frequency)
+- **Spatial layout**: ~31×32 grid with physical electrode coordinates
+
+### Key Hints from Documentation
+- Neural information is **sparse and frequency-specific**
+- Successful teams look at **spectral power changes** in specific frequency bands
+- **Small data regime**: Must be data-efficient
+
+---
+
+## Optimization Strategy
+
+### Priority 1: Maximize Accuracy (50% of score)
+Focus here first - linear scaling means every percentage point matters.
+
+### Priority 2: Minimize Latency (25% of score)
+Non-linear rewards for improvements under 100ms.
+
+### Priority 3: Minimize Model Size (25% of score)
+Non-linear rewards for models under 1MB.
+
+---
+
+## Implementation Plan
+
+### Phase 1: Data Exploration & Understanding
+- [ ] Download and explore training/validation data
+- [ ] Analyze label distribution and class balance
+- [ ] Visualize raw signals during stimulus vs silence
+- [ ] Identify which frequency bands show activity changes
+- [ ] Understand the spatial patterns across the electrode grid
+
+### Phase 2: Quick Baseline
+- [ ] Run existing MLP to establish baseline score
+- [ ] Identify obvious improvements (normalization, etc.)
+
+### Phase 3: EEG-TCNet Implementation
+- [ ] Create `eeg_tcnet.py` with new model class
+- [ ] Implement EEGNet block (temporal conv → depthwise spatial → separable conv)
+- [ ] Implement TCN block (dilated causal convolutions with residual connections)
+- [ ] Wire up the full architecture: EEGNet → TCN → classifier
+- [ ] Handle streaming inference (maintain causal constraint)
+- [ ] Train on full dataset and evaluate
+
+### Phase 4: Feature Engineering (Optional Enhancement)
+- [ ] Implement causal bandpass filtering (focus on high-gamma 70-150Hz)
+- [ ] Add rolling statistics if helpful
+- [ ] Test channel selection to reduce input size
+
+### Phase 5: Optimization & Compression
+- [ ] Hyperparameter tuning
+- [ ] Quantization if needed (int8)
+- [ ] Pruning if size is an issue
+- [ ] Ensure size < 1MB for optimal score
+
+### Phase 6: Final Validation & Submission
+- [ ] Final evaluation on validation set
+- [ ] Calculate expected score
+- [ ] Prepare submission
+
+---
+
+## Technical Constraints
+
+### Must Follow
+- Inherit from `BaseModel` class
+- Implement: `fit_model()`, `predict()`, `save()`, `load()`
+- Model file must be inside repository
+- Causal inference only (no future data)
+- Size ≤25MB
+
+### Cannot Modify
+- `brainstorm/ml/base.py`
+- `brainstorm/evaluation.py`
+- `brainstorm/ml/metrics.py`
+
+---
+
+## Model Architecture Options (Research-Backed)
+
+### Option A: EEGNet (Recommended for Simplicity)
+**What it is**: A very compact neural network designed specifically for brain signal classification.
+
+**How it works**:
+- Uses special "depthwise" convolutions that process each electrode channel separately first
+- Then combines information across channels efficiently
+- Think of it like: first listen to each instrument in an orchestra separately, then blend them together
+
+**Pros**:
+- Extremely small (~10-50KB typically)
+- Works well with limited training data
+- Well-tested across many brain signal datasets
+- Simple to implement and tune
+
+**Cons**:
+- Processes each time point independently (no memory of past)
+- May miss patterns that unfold over time
+
+**Best for**: If model size is critical and data is limited
+
+**Reference**: [EEGNet Paper](https://arxiv.org/abs/1611.08024)
+
+---
+
+### Option B: TCN (Temporal Convolutional Network)
+**What it is**: A network that uses "dilated" convolutions to see further back in time efficiently.
+
+**How it works**:
+- Normal convolutions look at nearby time points (e.g., last 3 samples)
+- Dilated convolutions "skip" time points, so they can see further back without more parameters
+- Example: with dilation=4, a filter of size 3 sees samples at t, t-4, t-8 instead of t, t-1, t-2
+- This creates a "pyramid" where each layer sees further into the past
+
+**Pros**:
+- Captures long-range time patterns (important for audio stimuli)
+- Naturally causal (only looks at past, perfect for streaming)
+- Parallelizable during training (faster than RNNs)
+- No vanishing gradient problems
+- Moderate size (~100KB - 1MB)
+
+**Cons**:
+- More complex to tune (dilation rates, number of layers)
+- Needs enough layers to cover the relevant time window
+
+**Best for**: When temporal patterns matter and you need real-time performance
+
+**Reference**: [TCN Paper](https://arxiv.org/abs/1803.01271)
+
+---
+
+### Option C: EEG-TCNet (Hybrid - Top Recommendation)
+**What it is**: Combines EEGNet's efficient spatial processing with TCN's temporal modeling.
+
+**How it works**:
+- Stage 1 (EEGNet-style): Extracts features from each time point across all channels
+- Stage 2 (TCN): Looks at patterns across time in those features
+- Think of it like: first identify what's happening at each moment, then track how things change
+
+**Pros**:
+- Best of both worlds: spatial AND temporal features
+- ~400KB memory footprint (well under 25MB limit)
+- Proven 77-84% accuracy on similar brain signal tasks
+- Specifically designed for embedded/edge deployment
+- Published code available
+
+**Cons**:
+- More hyperparameters to tune
+- Slightly more complex implementation
+
+**Best for**: Maximizing accuracy while staying lightweight
+
+**Reference**: [EEG-TCNet Paper](https://arxiv.org/abs/2006.00622), [GitHub](https://github.com/iis-eth-zurich/eeg-tcnet)
+
+---
+
+### Option D: Simple MLP with Smart Features (Baseline++)
+**What it is**: Keep the simple MLP but invest effort in feature engineering.
+
+**How it works**:
+- Extract meaningful features: spectral power in frequency bands, rolling statistics
+- Use PCA or channel selection to reduce dimensions
+- Feed to a compact MLP
+
+**Pros**:
+- Simplest to implement and debug
+- Very fast inference
+- Tiny model size (<100KB)
+- Interpretable features
+
+**Cons**:
+- Feature engineering requires domain knowledge
+- May not capture complex patterns
+- Performance ceiling likely lower
+
+**Best for**: Quick baseline, interpretability, or if other approaches fail
+
+---
+
+### Option E: Lightweight Attention/Transformer
+**What it is**: Uses "attention" mechanism to decide which channels and time points matter most.
+
+**How it works**:
+- Attention lets the model learn to focus on relevant electrodes dynamically
+- Can weight different time points differently based on context
+
+**Pros**:
+- Can learn complex relationships
+- Interpretable attention weights show what model focuses on
+- State-of-the-art in many sequence tasks
+
+**Cons**:
+- Typically larger models
+- May overfit with limited data
+- More compute-intensive
+- Harder to make efficient for edge deployment
+
+**Best for**: If you have enough data and compute isn't a concern
+
+---
+
+## Architecture Comparison Summary
+
+| Architecture | Model Size | Temporal Context | Complexity | Data Efficiency | Recommended? |
+|-------------|------------|------------------|------------|-----------------|--------------|
+| EEGNet | ~10-50KB | None | Low | High | ✓ Good start |
+| TCN | ~100KB-1MB | Excellent | Medium | Medium | ✓ Good |
+| EEG-TCNet | ~400KB | Excellent | Medium-High | High | ⭐ Best bet |
+| MLP+Features | <100KB | Manual | Low | High | ✓ Baseline |
+| Transformer | 1-10MB+ | Excellent | High | Low | ⚠ Risky |
+
+---
+
+## Recommended Strategy
+
+**Primary Path**: EEG-TCNet
+- Leverages proven architecture for brain signals
+- Captures both spatial (electrode) and temporal (time) patterns
+- Small enough for edge deployment
+- Published benchmarks show strong performance
+
+**Fallback Path**: EEGNet → add TCN if needed
+- Start simple, add complexity only if needed
+- Easier to debug and understand
+
+**Feature Engineering** (applies to all):
+- High-gamma band power (70-150 Hz) is often most informative for ECoG
+- Causal bandpass filtering for streaming
+- Consider PCA for dimensionality reduction
+
+---
+
+## Evaluation Checkpoints
+
+| Checkpoint | Target Score | Focus |
+|------------|--------------|-------|
+| Baseline | >30 | Get working pipeline |
+| Feature Engineering | >50 | Spectral features |
+| Architecture Search | >60 | Best model type |
+| Optimization | >70 | Tuning + compression |
+| Final | >80 | All optimizations |
+
+---
+
+## Notes & Ideas
+
+### Spectral Features to Try
+- Delta (1-4 Hz): Slow oscillations
+- Theta (4-8 Hz): Memory/attention
+- Alpha (8-13 Hz): Inhibition
+- Beta (13-30 Hz): Motor/attention
+- Gamma (30-100 Hz): Local processing, sensory
+- High Gamma (70-150 Hz): Often most informative for ECoG
+
+### Causal Filtering Methods
+- One-sided exponential moving average
+- Causal IIR filters (Butterworth, etc.)
+- Rolling window statistics
+
+### Model Compression Techniques
+- Weight pruning
+- Quantization (int8)
+- Knowledge distillation
+- Removing optimizer state from checkpoint
+
+---
+
+## Current Status
+
+**Phase**: Planning Complete
+**Chosen Architecture**: EEG-TCNet
+**Priority**: Maximize Accuracy (50% of score)
+**Strategy**: Single focused implementation
+
+---
+
+## Decisions Made
+
+1. **Architecture**: EEG-TCNet - combines EEGNet spatial processing with TCN temporal modeling
+2. **Priority**: Accuracy first, then optimize size/latency
+3. **Approach**: One well-tuned solution rather than multiple experiments
+
+---
+
+## EEG-TCNet Implementation Details
+
+### Architecture Overview
+
+```
+Input: (batch, 1, time_window, 1024 channels)
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  STAGE 1: EEGNet-style Features     │
+│  ────────────────────────────────── │
+│  1. Temporal Conv (learn frequency  │
+│     filters across time)            │
+│  2. Depthwise Conv (spatial filters │
+│     for each frequency band)        │
+│  3. Separable Conv (mix features)   │
+│  4. Pooling + Dropout               │
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  STAGE 2: TCN Temporal Processing   │
+│  ────────────────────────────────── │
+│  Residual blocks with:              │
+│  - Dilated causal conv (d=1,2,4,8)  │
+│  - Batch normalization              │
+│  - ELU activation                   │
+│  - Dropout                          │
+│  - Skip connections                 │
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  STAGE 3: Classification            │
+│  ────────────────────────────────── │
+│  Dense layer → Softmax              │
+└─────────────────────────────────────┘
+         │
+         ▼
+Output: Predicted frequency class
+```
+
+### Key Hyperparameters to Tune
+
+| Parameter | Description | Typical Range | Start With |
+|-----------|-------------|---------------|------------|
+| F1 | # temporal filters | 4-16 | 8 |
+| D | Depth multiplier | 1-4 | 2 |
+| F2 | # separable filters | 8-32 | 16 |
+| kernel_length | Temporal conv size | 32-128 | 64 |
+| tcn_filters | TCN channel width | 12-32 | 16 |
+| tcn_layers | # TCN residual blocks | 2-4 | 2 |
+| dropout | Regularization | 0.2-0.5 | 0.3 |
+
+### Receptive Field Calculation
+
+For TCN with dilations [1, 2, 4, 8] and kernel size 4:
+- Receptive field = (kernel_size - 1) × sum(dilations) + 1
+- = (4 - 1) × (1 + 2 + 4 + 8) + 1 = 46 samples = 46ms
+
+For 500ms coverage, need larger dilations or more layers.
+
+### Expected Model Size
+
+- EEGNet portion: ~10-30KB
+- TCN portion: ~100-300KB
+- Total: ~150-400KB (well under 25MB limit, good for size score)
+
+---
+
+## Next Step
+
+**Phase 1**: Download data and run existing MLP baseline to establish a benchmark score.
