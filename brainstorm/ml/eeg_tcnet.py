@@ -13,7 +13,6 @@ Reference:
 
 from pathlib import Path
 from typing import Self
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,53 +20,108 @@ import torch.nn.functional as F
 from loguru import logger
 from tqdm import tqdm
 
-from brainstorm.constants import N_CHANNELS
 from brainstorm.ml.base import BaseModel
 
 
 # Fixed model path within the repository
 _REPO_ROOT = Path(__file__).parent.parent.parent
-MODEL_PATH = _REPO_ROOT / "model.pt"
+MODEL_PATH = _REPO_ROOT / "eeg_tcnet.pt"
+
+def _get_device() -> torch.device:
+    return torch.device("cpu")
+
+
+def _group_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
+    """Create GroupNorm with a safe group count for the channel size."""
+    groups = min(max_groups, num_channels)
+    while num_channels % groups != 0 and groups > 1:
+        groups -= 1
+    return nn.GroupNorm(groups, num_channels)
 
 
 class EEGNetBlock(nn.Module):
     """
-    EEGNet-style spatial feature extraction block.
+    EEGNet-style feature extraction block over time + space.
 
-    Processes each time sample across all channels to extract spatial features.
-    Uses depthwise separable convolutions for efficiency.
+    Processes sequences of spatial grids to extract temporal and spatial features
+    using depthwise separable convolutions.
     """
 
     def __init__(
         self,
-        n_channels: int = N_CHANNELS,
+        in_channels: int,
+        height: int,
+        width: int,
+        temporal_kernel: int = 32,
         F1: int = 8,           # Number of temporal filters
         D: int = 2,            # Depth multiplier for spatial filters
         F2: int = 16,          # Number of pointwise filters
+        F2_bottleneck: int | None = 8,  # Optional channel bottleneck before TCN
         dropout: float = 0.3,
+        use_mask: bool = True,
     ):
         super().__init__()
 
+        self.in_channels = in_channels
+        self.height = height
+        self.width = width
+        self.temporal_kernel = temporal_kernel
         self.F1 = F1
         self.D = D
         self.F2 = F2
+        self.F2_bottleneck = F2_bottleneck
+        self.use_mask = use_mask
+        if self.use_mask and self.in_channels < 2:
+            raise ValueError("use_mask requires input_channels >= 2")
+        self.conv_in_channels = self.in_channels - 1 if self.use_mask else self.in_channels
 
         # Temporal convolution: learns frequency filters
-        # Input: (batch, 1, n_channels) -> (batch, F1, n_channels)
-        self.temporal_conv = nn.Conv1d(1, F1, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(F1)
-
-        # Depthwise spatial convolution: learns spatial filters per temporal filter
-        # Input: (batch, F1, n_channels) -> (batch, F1*D, 1)
-        self.depthwise_conv = nn.Conv1d(
-            F1, F1 * D, kernel_size=n_channels, groups=F1, bias=False
+        # Input: (batch, in_channels, time, H, W) -> (batch, F1, time, H, W)
+        self.temporal_conv = nn.Conv3d(
+            self.conv_in_channels,
+            F1,
+            kernel_size=(temporal_kernel, 1, 1),
+            bias=False,
         )
-        self.bn2 = nn.BatchNorm1d(F1 * D)
+        self.bn1 = _group_norm(F1)
+
+        # Depthwise LOCAL spatial conv(s): learn local motifs without collapsing HxW immediately
+        # Input: (batch, F1, time, H, W) -> (batch, F1*D, time, H, W)
+        self.depthwise_conv1 = nn.Conv3d(
+            F1,
+            F1 * D,
+            kernel_size=(1, 3, 3),
+            padding=(0, 1, 1),
+            groups=F1,
+            bias=False,
+        )
+        self.bn2a = _group_norm(F1 * D)
+
+        # Optional: a second local depthwise conv at the expanded channel count
+        self.depthwise_conv2 = nn.Conv3d(
+            F1 * D,
+            F1 * D,
+            kernel_size=(1, 3, 3),
+            padding=(0, 1, 1),
+            groups=F1 * D,
+            bias=False,
+        )
+        self.bn2b = _group_norm(F1 * D)
 
         # Pointwise convolution: mixes features
-        # Input: (batch, F1*D, 1) -> (batch, F2, 1)
-        self.pointwise_conv = nn.Conv1d(F1 * D, F2, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm1d(F2)
+        # Input: (batch, F1*D, time, 1, 1) -> (batch, F2, time, 1, 1)
+        self.pointwise_conv = nn.Conv3d(F1 * D, F2, kernel_size=1, bias=False)
+        self.bn3 = _group_norm(F2)
+
+        # Optional bottleneck to reduce channel count before TCN
+        if self.F2_bottleneck is not None:
+            self.bottleneck = nn.Conv3d(F2, self.F2_bottleneck, kernel_size=1, bias=False)
+            self.bn4 = _group_norm(self.F2_bottleneck)
+            self.output_channels = self.F2_bottleneck
+        else:
+            self.bottleneck = None
+            self.bn4 = None
+            self.output_channels = F2
 
         self.dropout = nn.Dropout(dropout)
         self.output_size = F2
@@ -77,32 +131,47 @@ class EEGNetBlock(nn.Module):
         Forward pass.
 
         Args:
-            x: Input tensor of shape (batch, n_channels)
+            x: Input tensor of shape (batch, in_channels, time, H, W)
 
         Returns:
-            Output tensor of shape (batch, F2)
+            Output tensor of shape (batch, F2, time, H, W)
         """
-        # Add channel dimension: (batch, n_channels) -> (batch, 1, n_channels)
-        x = x.unsqueeze(1)
+        # Causal padding on the temporal dimension
+        if self.temporal_kernel > 1:
+            x = F.pad(x, (0, 0, 0, 0, self.temporal_kernel - 1, 0))
+
+        if self.use_mask:
+            mask = x[:, -1:, :, :, :]              # (B,1,T,H,W)
+            x = x[:, :-1, :, :, :] * mask          # gate bands by electrode presence
 
         # Temporal convolution
         x = self.temporal_conv(x)
         x = self.bn1(x)
-
-        # Depthwise spatial convolution
-        x = self.depthwise_conv(x)
-        x = self.bn2(x)
         x = F.elu(x)
         x = self.dropout(x)
 
-        # Pointwise convolution
+        # Depthwise LOCAL spatial conv(s)
+        x = self.depthwise_conv1(x)
+        x = self.bn2a(x)
+        x = F.elu(x)
+        x = self.dropout(x)
+
+        x = self.depthwise_conv2(x)
+        x = self.bn2b(x)
+        x = F.elu(x)
+        x = self.dropout(x)
+
+        # Pointwise convolution (mix channels)
         x = self.pointwise_conv(x)
         x = self.bn3(x)
         x = F.elu(x)
         x = self.dropout(x)
 
-        # Remove spatial dimension: (batch, F2, 1) -> (batch, F2)
-        x = x.squeeze(-1)
+        if self.bottleneck is not None:
+            x = self.bottleneck(x)
+            x = self.bn4(x)  # type: ignore[arg-type]
+            x = F.elu(x)
+            x = self.dropout(x)
 
         return x
 
@@ -138,7 +207,7 @@ class TCNBlock(nn.Module):
             padding=self.padding,
             bias=False
         )
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.bn1 = _group_norm(out_channels)
 
         self.conv2 = nn.Conv1d(
             out_channels, out_channels,
@@ -147,7 +216,7 @@ class TCNBlock(nn.Module):
             padding=self.padding,
             bias=False
         )
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.bn2 = _group_norm(out_channels)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -190,22 +259,26 @@ class EEGTCNet(BaseModel):
     EEG-TCNet: Hybrid architecture combining EEGNet and TCN.
 
     Architecture:
-        Input (n_channels)
-        -> EEGNet block (spatial features)
+        Input (feature_dim = input_channels * height * width)
+        -> EEGNet block (temporal + spatial features)
         -> TCN blocks (temporal features)
         -> Linear classifier
 
-    For streaming inference, the model maintains a buffer of past features
-    and applies TCN causally.
+    For streaming inference, the model maintains a buffer of past grids
+    and applies the model causally.
     """
 
     def __init__(
         self,
-        n_channels: int = N_CHANNELS,
+        input_channels: int,
+        height: int,
+        width: int,
         # EEGNet parameters
         F1: int = 8,
         D: int = 2,
         F2: int = 16,
+        temporal_kernel: int = 32,
+        F2_bottleneck: int | None = 8,
         # TCN parameters
         tcn_channels: int = 16,
         tcn_kernel_size: int = 4,
@@ -213,19 +286,26 @@ class EEGTCNet(BaseModel):
         # General
         dropout: float = 0.3,
         # Context window for TCN (in samples)
-        context_window: int = 64,
+        context_window: int = 96,
+        use_mask: bool = True,
     ):
         super().__init__()
 
-        self.n_channels = n_channels
+        self.input_channels = input_channels
+        self.height = height
+        self.width = width
         self.F1 = F1
         self.D = D
         self.F2 = F2
+        self.temporal_kernel = temporal_kernel
+        self.F2_bottleneck = F2_bottleneck
         self.tcn_channels = tcn_channels
         self.tcn_kernel_size = tcn_kernel_size
         self.tcn_layers = tcn_layers
         self.dropout_rate = dropout
         self.context_window = context_window
+        self.input_size = input_channels * height * width
+        self.use_mask = use_mask
 
         self.classes_: np.ndarray | None = None
         self._n_classes: int | None = None
@@ -234,17 +314,25 @@ class EEGTCNet(BaseModel):
         self._feature_buffer: torch.Tensor | None = None
 
         # EEGNet block for spatial feature extraction
+        if context_window < temporal_kernel:
+            raise ValueError("context_window must be >= temporal_kernel")
+
         self.eegnet = EEGNetBlock(
-            n_channels=n_channels,
+            in_channels=input_channels,
+            height=height,
+            width=width,
+            temporal_kernel=temporal_kernel,
             F1=F1,
             D=D,
             F2=F2,
+            F2_bottleneck=F2_bottleneck,
             dropout=dropout,
+            use_mask=use_mask,
         )
 
         # TCN blocks with increasing dilation
         self.tcn_blocks = nn.ModuleList()
-        in_ch = F2
+        in_ch = self.eegnet.output_channels * height * width
         for i in range(tcn_layers):
             dilation = 2 ** i
             self.tcn_blocks.append(
@@ -261,25 +349,17 @@ class EEGTCNet(BaseModel):
         # Classifier (will be built after we know n_classes)
         self.classifier: nn.Linear | None = None
 
-        # Normalization stats (computed during training)
-        self.register_buffer('mean', torch.zeros(n_channels))
-        self.register_buffer('std', torch.ones(n_channels))
-
     def _build_classifier(self, n_classes: int) -> None:
         """Build the classifier layer once n_classes is known."""
         self._n_classes = n_classes
         self.classifier = nn.Linear(self.tcn_channels, n_classes)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input features."""
-        return (x - self.mean) / (self.std + 1e-8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for batch training.
 
         Args:
-            x: Input tensor of shape (batch, seq_len, n_channels)
+            x: Input tensor of shape (batch, seq_len, feature_dim)
 
         Returns:
             Logits tensor of shape (batch, seq_len, n_classes)
@@ -287,18 +367,31 @@ class EEGTCNet(BaseModel):
         if self.classifier is None:
             raise RuntimeError("Model not initialized. Call fit() first.")
 
-        batch_size, seq_len, n_channels = x.shape
+        if x.ndim == 5:
+            batch_size, seq_len, _, _, _ = x.shape
+            x = x.permute(0, 2, 1, 3, 4)
+        else:
+            batch_size, seq_len, feature_dim = x.shape
+            if feature_dim != self.input_size:
+                raise ValueError(
+                    f"Expected feature_dim {self.input_size}, got {feature_dim}"
+                )
+            x = x.reshape(
+                batch_size,
+                seq_len,
+                self.input_channels,
+                self.height,
+                self.width,
+            )
+            x = x.permute(0, 2, 1, 3, 4)
 
-        # Normalize
-        x = self._normalize(x)
-
-        # Apply EEGNet to each timestep
-        # Reshape: (batch, seq_len, n_channels) -> (batch*seq_len, n_channels)
-        x = x.reshape(-1, n_channels)
-        x = self.eegnet(x)  # (batch*seq_len, F2)
-
-        # Reshape for TCN: (batch*seq_len, F2) -> (batch, F2, seq_len)
-        x = x.reshape(batch_size, seq_len, -1).permute(0, 2, 1)
+        # EEGNet block: (batch, input_channels, time, H, W) -> (batch, C, time, H, W)
+        x = self.eegnet(x)
+        x = x.reshape(
+            batch_size,
+            self.eegnet.output_channels * self.height * self.width,
+            seq_len,
+        )
 
         # Apply TCN blocks
         for tcn_block in self.tcn_blocks:
@@ -318,7 +411,7 @@ class EEGTCNet(BaseModel):
         Maintains a buffer of past features for TCN context.
 
         Args:
-            X: Feature array of shape (n_channels,) for a single timestep.
+            X: Feature array of shape (feature_dim,) for a single timestep.
 
         Returns:
             Predicted label as an integer.
@@ -326,34 +419,43 @@ class EEGTCNet(BaseModel):
         if self.classes_ is None or self.classifier is None:
             raise RuntimeError("Model not trained. Call fit() first.")
 
+        device = next(self.parameters()).device
         self.eval()
         with torch.no_grad():
-            x = torch.tensor(X, dtype=torch.float32)
+            x = torch.tensor(X, dtype=torch.float32, device=device)
+            if x.numel() != self.input_size:
+                raise ValueError(
+                    f"Expected feature_dim {self.input_size}, got {x.numel()}"
+                )
+            x = x.reshape(self.input_channels, self.height, self.width)
 
-            # Normalize
-            x = self._normalize(x)
-
-            # Extract spatial features with EEGNet
-            features = self.eegnet(x.unsqueeze(0))  # (1, F2)
-
-            # Update feature buffer
             if self._feature_buffer is None:
-                self._feature_buffer = features.repeat(self.context_window, 1)
+                pad_len = self.context_window - 1
+                pad = torch.zeros(
+                    pad_len,
+                    self.input_channels,
+                    self.height,
+                    self.width,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                self._feature_buffer = torch.cat([pad, x.unsqueeze(0)], dim=0)
             else:
-                self._feature_buffer = torch.cat([
-                    self._feature_buffer[1:],
-                    features
-                ], dim=0)
+                self._feature_buffer = torch.cat(
+                    [self._feature_buffer[1:], x.unsqueeze(0)], dim=0
+                )
 
-            # Apply TCN on buffer
-            # (context_window, F2) -> (1, F2, context_window)
-            x = self._feature_buffer.unsqueeze(0).permute(0, 2, 1)
-
+            x_seq = self._feature_buffer.unsqueeze(0).permute(0, 2, 1, 3, 4)
+            x = self.eegnet(x_seq)
+            x = x.reshape(
+                1,
+                self.eegnet.output_channels * self.height * self.width,
+                self.context_window,
+            )
             for tcn_block in self.tcn_blocks:
                 x = tcn_block(x)
 
-            # Get prediction for last timestep
-            x = x[:, :, -1]  # (1, tcn_channels)
+            x = x[:, :, -1]
             logits = self.classifier(x)
             predicted_idx = int(torch.argmax(logits, dim=1).item())
 
@@ -369,9 +471,15 @@ class EEGTCNet(BaseModel):
         y: np.ndarray,
         epochs: int = 30,
         batch_size: int = 32,
-        seq_len: int = 64,
+        seq_len: int = 96,
+        stride: int | None = None,
+        chunk_len: int | None = None,
+        chunks_per_epoch: int = 4,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
+        stratify_sequences: bool = False,
+        stratify_ratio: float = 0.45,
+        loss_last_k: int = 1,
         verbose: bool = True,
         **kwargs,
     ) -> None:
@@ -384,14 +492,12 @@ class EEGTCNet(BaseModel):
             epochs: Number of training epochs.
             batch_size: Number of sequences per batch.
             seq_len: Length of each training sequence.
+            chunk_len: Length of each contiguous chunk sampled per epoch.
+            chunks_per_epoch: Number of random chunks to sample per epoch.
             learning_rate: Learning rate for Adam optimizer.
             weight_decay: L2 regularization weight.
             verbose: Whether to show progress.
         """
-        # Compute normalization statistics
-        self.mean = torch.tensor(X.mean(axis=0), dtype=torch.float32)
-        self.std = torch.tensor(X.std(axis=0), dtype=torch.float32)
-
         # Determine classes
         self.classes_ = np.unique(y)
         n_classes = len(self.classes_)
@@ -402,20 +508,30 @@ class EEGTCNet(BaseModel):
         # Build classifier
         self._build_classifier(n_classes)
 
-        # Compute class weights for imbalanced data
-        class_counts = np.bincount([class_to_idx[label] for label in y])
-        class_weights = 1.0 / (class_counts + 1)
-        class_weights = class_weights / class_weights.sum() * n_classes
-        class_weights = torch.tensor(class_weights, dtype=torch.float32)
+        device = _get_device()
+        self.to(device)
 
         # Convert to tensors
-        X_tensor = torch.tensor(X, dtype=torch.float32)
+        if X.shape[1] != self.input_size:
+            raise ValueError(
+                f"Expected feature_dim {self.input_size}, got {X.shape[1]}"
+            )
+        X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
         y_indices = np.array([class_to_idx[label] for label in y])
-        y_tensor = torch.tensor(y_indices, dtype=torch.long)
+        y_tensor = torch.tensor(y_indices, dtype=torch.long, device=device)
 
         # Create sequences for training
         n_samples = len(X)
-        n_sequences = (n_samples - seq_len) // (seq_len // 2)  # 50% overlap
+        stride = stride or (seq_len * 3 // 4)
+        if chunk_len is not None:
+            if chunk_len <= seq_len:
+                raise ValueError("chunk_len must be greater than seq_len")
+            if chunk_len > n_samples:
+                raise ValueError("chunk_len must be <= number of samples")
+
+        nonzero = (y != 0).astype(np.int32)
+        nonzero_classes = [c for c in self.classes_ if c != 0]
+        nonzero_classes = np.array(nonzero_classes)
 
         # Setup training
         self.train()
@@ -424,7 +540,7 @@ class EEGTCNet(BaseModel):
             lr=learning_rate,
             weight_decay=weight_decay
         )
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = nn.CrossEntropyLoss()
 
         # Learning rate scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -434,45 +550,103 @@ class EEGTCNet(BaseModel):
         # Training loop
         best_loss = float('inf')
         epoch_iterator = tqdm(range(epochs), desc="Training", disable=not verbose)
+        seq_offsets = torch.arange(seq_len, dtype=torch.long, device=device)
+
+        def _build_starts_for_chunk(chunk_start: int, chunk_end: int) -> np.ndarray:
+            starts_all = np.arange(chunk_start, chunk_end - seq_len, stride)
+            if len(starts_all) == 0:
+                return starts_all
+            n_sequences = len(starts_all)
+            if stratify_sequences:
+                n_balanced = max(1, int(n_sequences * stratify_ratio))
+                per_class = max(1, n_balanced // max(len(nonzero_classes), 1))
+
+                balanced_starts = []
+                for cls in nonzero_classes:
+                    idx = np.where(y == cls)[0]
+                    if idx.size == 0:
+                        continue
+                    starts = idx - (seq_len // 2)
+                    starts = np.clip(starts, chunk_start, chunk_end - seq_len - 1)
+                    starts = (starts // stride) * stride
+                    starts = starts[
+                        (starts >= chunk_start)
+                        & (starts <= (chunk_end - seq_len - 1))
+                    ]
+                    if starts.size == 0:
+                        continue
+                    starts = np.unique(starts)
+                    take = min(per_class, starts.size)
+                    balanced_starts.append(np.random.permutation(starts)[:take])
+                if balanced_starts:
+                    balanced_starts = np.concatenate(balanced_starts)
+                else:
+                    balanced_starts = np.array([], dtype=int)
+
+                n_random = n_sequences - len(balanced_starts)
+                if n_random > 0:
+                    random_starts = np.random.permutation(starts_all)[:n_random]
+                    starts = np.concatenate([balanced_starts, random_starts])
+                else:
+                    starts = balanced_starts[:n_sequences]
+                return np.random.permutation(starts)
+
+            return np.random.permutation(starts_all)
 
         for epoch in epoch_iterator:
             total_loss = 0.0
             n_batches = 0
+            correct = 0
+            total = 0
 
-            # Shuffle sequence starting points
-            starts = np.random.permutation(n_samples - seq_len)[:n_sequences]
+            if chunk_len is None:
+                chunk_starts = [_build_starts_for_chunk(0, n_samples)]
+            else:
+                chunk_starts = []
+                max_start = n_samples - chunk_len
+                for _ in range(chunks_per_epoch):
+                    start = int(np.random.randint(0, max_start + 1))
+                    end = start + chunk_len
+                    starts = _build_starts_for_chunk(start, end)
+                    if len(starts) > 0:
+                        chunk_starts.append(starts)
 
-            for batch_start in range(0, len(starts), batch_size):
-                batch_indices = starts[batch_start:batch_start + batch_size]
+            for starts in chunk_starts:
+                for batch_start in range(0, len(starts), batch_size):
+                    batch_indices = starts[batch_start:batch_start + batch_size]
+                    batch_indices_t = torch.as_tensor(
+                        batch_indices, dtype=torch.long, device=device
+                    )
+                    idx = batch_indices_t[:, None] + seq_offsets[None, :]
 
-                # Build batch of sequences
-                X_batch = torch.stack([
-                    X_tensor[i:i + seq_len] for i in batch_indices
-                ])  # (batch, seq_len, n_channels)
+                    # Build batch of sequences (vectorized indexing)
+                    X_batch = X_tensor[idx]  # (batch, seq_len, n_channels)
+                    y_batch = y_tensor[idx]  # (batch, seq_len)
 
-                y_batch = torch.stack([
-                    y_tensor[i:i + seq_len] for i in batch_indices
-                ])  # (batch, seq_len)
+                    optimizer.zero_grad()
+                    logits = self.forward(X_batch)  # (batch, seq_len, n_classes)
 
-                optimizer.zero_grad()
-                logits = self.forward(X_batch)  # (batch, seq_len, n_classes)
+                    k = max(1, min(loss_last_k, seq_len))
+                    logits_k = logits[:, -k:, :].reshape(-1, n_classes)
+                    y_k = y_batch[:, -k:].reshape(-1)
+                    loss = criterion(logits_k, y_k)
 
-                # Flatten for loss computation
-                loss = criterion(
-                    logits.reshape(-1, n_classes),
-                    y_batch.reshape(-1)
-                )
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                    optimizer.step()
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-                optimizer.step()
+                    total_loss += loss.item()
+                    n_batches += 1
 
-                total_loss += loss.item()
-                n_batches += 1
+                    with torch.no_grad():
+                        preds = torch.argmax(logits[:, -k:, :], dim=-1)
+                        correct += (preds == y_batch[:, -k:]).sum().item()
+                        total += y_batch[:, -k:].numel()
 
             scheduler.step()
             avg_loss = total_loss / max(n_batches, 1)
-            epoch_iterator.set_postfix(loss=f"{avg_loss:.4f}")
+            train_acc = correct / max(total, 1)
+            epoch_iterator.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{train_acc:.3f}")
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
@@ -487,15 +661,20 @@ class EEGTCNet(BaseModel):
 
         checkpoint = {
             "config": {
-                "n_channels": self.n_channels,
+                "input_channels": self.input_channels,
+                "height": self.height,
+                "width": self.width,
                 "F1": self.F1,
                 "D": self.D,
                 "F2": self.F2,
+                "temporal_kernel": self.temporal_kernel,
+                "F2_bottleneck": self.F2_bottleneck,
                 "tcn_channels": self.tcn_channels,
                 "tcn_kernel_size": self.tcn_kernel_size,
                 "tcn_layers": self.tcn_layers,
                 "dropout": self.dropout_rate,
                 "context_window": self.context_window,
+                "use_mask": self.use_mask,
                 "n_classes": self._n_classes,
             },
             "classes": self.classes_,
@@ -516,15 +695,20 @@ class EEGTCNet(BaseModel):
         config = checkpoint["config"]
 
         model = cls(
-            n_channels=config["n_channels"],
+            input_channels=config["input_channels"],
+            height=config["height"],
+            width=config["width"],
             F1=config["F1"],
             D=config["D"],
             F2=config["F2"],
+            temporal_kernel=config["temporal_kernel"],
+            F2_bottleneck=config.get("F2_bottleneck", None),
             tcn_channels=config["tcn_channels"],
             tcn_kernel_size=config["tcn_kernel_size"],
             tcn_layers=config["tcn_layers"],
             dropout=config["dropout"],
             context_window=config["context_window"],
+            use_mask=config.get("use_mask", True),
         )
 
         model._build_classifier(config["n_classes"])

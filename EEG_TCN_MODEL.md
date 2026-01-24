@@ -13,19 +13,19 @@ This project implements a neural decoder for real-time auditory stimulus classif
 EEG-TCNet combines two proven architectures for brain signal processing:
 
 ```
-Input: (batch, seq_len, 1024 channels)
+Input: (batch, seq_len, (B+1), 16, 16 spatial grids)
               │
               ▼
 ┌─────────────────────────────────────────────┐
-│         STAGE 1: EEGNet Block               │
+│         STAGE 1: EEGNet Block (3D)          │
 │  ─────────────────────────────────────────  │
-│  Temporal Conv (1→16 filters)               │
+│  Temporal Conv3D ((B+1)→F1, k=32)           │
 │      │                                      │
-│  Depthwise Spatial Conv (16→32 filters)     │
-│  - Processes each channel independently     │
+│  Depthwise Spatial Conv3D (F1→F1*D)         │
+│  - Kernel over full 16x16 grid              │
 │  - Learns spatial patterns across cortex    │
 │      │                                      │
-│  Pointwise Conv (32→32 filters)             │
+│  Pointwise Conv3D (F1*D→F2)                 │
 │  - Mixes features across channels           │
 │      │                                      │
 │  BatchNorm + ELU + Dropout(0.4)             │
@@ -59,6 +59,13 @@ Input: (batch, seq_len, 1024 channels)
         Output: Predicted frequency
 ```
 
+### Preprocessing (Input Features)
+
+Raw voltages are transformed into bandpower features, mapped to 31x32 spatial grids,
+an electrode mask channel is appended, and the grid is padded to 32x32 then pooled
+to 16x16. The final per-timestep tensor has shape `(B+1, 16, 16)` and is flattened
+for model input.
+
 ### Key Design Decisions
 
 1. **Depthwise Separable Convolutions**: Reduces parameters by ~10x compared to standard convolutions while maintaining performance.
@@ -69,7 +76,8 @@ Input: (batch, seq_len, 1024 channels)
 
 4. **Class Weighting**: Handles the severe class imbalance (67% silence, 33% sounds) by weighting the loss function inversely proportional to class frequency.
 
-5. **Input Normalization**: Z-score normalization computed on training data and applied during inference.
+5. **Spatial Grid Input**: Features are mapped to 16x16 spatial grids with an electrode mask channel to preserve geometry and indicate missing electrodes.
+6. **Input Normalization**: Bandpower features are z-scored using training statistics and reused for validation/inference.
 
 ### Hyperparameters
 
@@ -78,11 +86,14 @@ Input: (batch, seq_len, 1024 channels)
 | F1 | 16 | Temporal filter count |
 | D | 2 | Depth multiplier |
 | F2 | 32 | Separable filter count |
+| temporal_kernel | 32 | Temporal kernel size (samples) |
 | tcn_channels | 32 | TCN hidden dimension |
 | tcn_kernel_size | 4 | TCN kernel size |
 | tcn_layers | 3 | Number of TCN blocks |
 | dropout | 0.4 | Dropout rate |
 | context_window | 128 | Samples of history for inference |
+| height, width | 16, 16 | Pooled spatial grid size |
+| input_channels | B+1 | Bandpower channels + electrode mask |
 | learning_rate | 1e-3 | Adam learning rate |
 | epochs | 40 | Training epochs |
 
@@ -212,7 +223,7 @@ brainstorm/
 ├── evaluation.py            # Model evaluation (DO NOT MODIFY)
 └── ...
 
-model.pt                     # Trained model weights
+eeg_tcnet.pt                 # Trained model weights
 model_metadata.json          # Model path and class info
 ```
 
@@ -222,19 +233,32 @@ model_metadata.json          # Model path and class info
 
 ### Training
 ```python
+from brainstorm.loading import load_raw_data, load_channel_coordinates
+from brainstorm.preprocessing import design_bandpass_sos, preprocess_spatial_features
 from brainstorm.ml.eeg_tcnet import EEGTCNet
-from brainstorm.loading import load_raw_data
 
 train_features, train_labels = load_raw_data("./data", step="train")
+coords = load_channel_coordinates()
+
+bands = [(1, 4), (4, 8), (8, 12), (13, 30), (30, 55), (65, 100), (100, 150), (150, 250)]
+sos_bank = design_bandpass_sos(bands, fs_hz=1000)
+train_spatial, stats = preprocess_spatial_features(
+    train_features.values, coords, sos_bank, fs_hz=1000, tau_s=0.05
+)
+
+X = train_spatial.reshape(train_spatial.shape[0], -1)
 
 model = EEGTCNet(
+    input_channels=train_spatial.shape[1],
+    height=train_spatial.shape[2],
+    width=train_spatial.shape[3],
     F1=16, D=2, F2=32,
     tcn_channels=32, tcn_layers=3,
     dropout=0.4, context_window=128
 )
 
 model.fit(
-    X=train_features.values,
+    X=X,
     y=train_labels["label"].values,
     epochs=40,
     batch_size=32,
