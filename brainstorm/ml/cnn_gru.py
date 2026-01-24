@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.quantization as tq
 from loguru import logger
 from scipy.signal import butter, lfilter, sosfilt
 from sklearn.metrics import balanced_accuracy_score
@@ -571,6 +572,12 @@ class CNNGRU(BaseModel):
     def save(self) -> Path:
         if self.classes_ is None or self._stats is None:
             raise RuntimeError("Cannot save untrained model. Call fit() first.")
+        engine = "qnnpack"
+        if engine in torch.backends.quantized.supported_engines:
+            torch.backends.quantized.engine = engine
+        quantized_model = tq.quantize_dynamic(
+            self, {nn.GRU, nn.Linear}, dtype=torch.qint8
+        )
         checkpoint = {
             "config": {
                 "bands_hz": self.bands_hz,
@@ -584,10 +591,12 @@ class CNNGRU(BaseModel):
                 "use_mask": self.use_mask,
                 "high_gamma_band": self.high_gamma_band,
                 "high_gamma_taus": self.high_gamma_taus,
+                "quantized": True,
+                "quantized_engine": torch.backends.quantized.engine,
                 "n_classes": self._n_classes,
             },
             "classes": self.classes_,
-            "state_dict": self.state_dict(),
+            "state_dict": quantized_model.state_dict(),
             "stats": {"mean": self._stats.mean, "std": self._stats.std},
             "channel_map": {
                 "channel_idx": self._channel_idx,
@@ -603,6 +612,12 @@ class CNNGRU(BaseModel):
     def load(cls) -> Self:
         if not MODEL_PATH.exists():
             raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        if torch.backends.quantized.supported_engines:
+            preferred = "qnnpack"
+            if preferred in torch.backends.quantized.supported_engines:
+                torch.backends.quantized.engine = preferred
+            else:
+                torch.backends.quantized.engine = torch.backends.quantized.supported_engines[0]
         checkpoint = torch.load(MODEL_PATH, weights_only=False)
         config = checkpoint["config"]
 
@@ -620,14 +635,22 @@ class CNNGRU(BaseModel):
             high_gamma_taus=config.get("high_gamma_taus"),
         )
         model._build_classifier(config["n_classes"])
+        quantized = bool(config.get("quantized", False))
+        if quantized:
+            engine = config.get("quantized_engine", "qnnpack")
+            if engine in torch.backends.quantized.supported_engines:
+                torch.backends.quantized.engine = engine
+            model = tq.quantize_dynamic(
+                model, {nn.GRU, nn.Linear}, dtype=torch.qint8
+            )
         model.classes_ = checkpoint["classes"]
-        model.load_state_dict(checkpoint["state_dict"])
         model._stats = NormalizerStats(
             mean=checkpoint["stats"]["mean"], std=checkpoint["stats"]["std"]
         )
         model._channel_idx = checkpoint["channel_map"]["channel_idx"]
         model._channel_x = checkpoint["channel_map"]["x"]
         model._channel_y = checkpoint["channel_map"]["y"]
+        model.load_state_dict(checkpoint["state_dict"])
         model._init_preprocessing()
         model.eval()
         logger.debug(f"Model loaded from {MODEL_PATH}")
