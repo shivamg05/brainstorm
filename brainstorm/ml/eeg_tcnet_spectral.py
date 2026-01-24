@@ -50,9 +50,7 @@ class SpatialBlock(nn.Module):
         self.bn1 = nn.BatchNorm1d(F1)
 
         # Spatial convolution across channels
-        self.spatial_conv = nn.Conv1d(
-            F1, F1 * D, kernel_size=n_channels, groups=F1, bias=False
-        )
+        self.spatial_conv = nn.Conv1d(F1, F1 * D, kernel_size=n_channels, groups=F1, bias=False)
         self.bn2 = nn.BatchNorm1d(F1 * D)
 
         # Pointwise
@@ -112,31 +110,25 @@ class TCNBlock(nn.Module):
         self.padding = (kernel_size - 1) * dilation
 
         self.conv1 = nn.Conv1d(
-            in_channels,
-            out_channels,
+            in_channels, out_channels,
             kernel_size=kernel_size,
             dilation=dilation,
             padding=self.padding,
-            bias=False,
+            bias=False
         )
         self.bn1 = nn.BatchNorm1d(out_channels)
 
         self.conv2 = nn.Conv1d(
-            out_channels,
-            out_channels,
+            out_channels, out_channels,
             kernel_size=kernel_size,
             dilation=dilation,
             padding=self.padding,
-            bias=False,
+            bias=False
         )
         self.bn2 = nn.BatchNorm1d(out_channels)
 
         self.dropout = nn.Dropout(dropout)
-        self.residual = (
-            nn.Conv1d(in_channels, out_channels, 1)
-            if in_channels != out_channels
-            else nn.Identity()
-        )
+        self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.residual(x)
@@ -162,17 +154,17 @@ class EEGTCNetSpectral(BaseModel):
 
     Architecture:
         Raw ECoG (1024 channels)
-        -> (OPTIONAL) PCA channel reduction (e.g., 1024 -> 64)   # CHANGE
         -> Spectral Feature Extraction (high-gamma, gamma, beta, etc.)
         -> Spatial Block (depthwise separable convs)
         -> TCN Blocks (dilated causal convs)
         -> Classifier
     """
 
+    # Focus on most informative bands for ECoG
     DEFAULT_BANDS = {
-        "high_gamma": (70, 150),
-        "gamma": (30, 70),
-        "beta": (13, 30),
+        'high_gamma': (70, 150),  # Most important for ECoG
+        'gamma': (30, 70),
+        'beta': (13, 30),
     }
 
     def __init__(
@@ -181,8 +173,6 @@ class EEGTCNetSpectral(BaseModel):
         # Spectral parameters
         bands: Optional[Dict[str, Tuple[float, float]]] = None,
         include_raw: bool = True,
-        # PCA parameters                                                   # CHANGE
-        n_pca_components: int = 64,                                       # CHANGE
         # Spatial block parameters
         F1: int = 8,
         D: int = 2,
@@ -197,14 +187,9 @@ class EEGTCNetSpectral(BaseModel):
     ):
         super().__init__()
 
-        # CHANGE: keep track of raw channel count separately
-        self.raw_n_channels = int(n_channels)                             # CHANGE
-        self.n_channels = int(n_channels)                                 # (will become post-PCA after fit)
-
+        self.n_channels = n_channels
         self.bands = bands or self.DEFAULT_BANDS
         self.include_raw = include_raw
-        self.n_pca_components = int(n_pca_components)                     # CHANGE
-
         self.F1 = F1
         self.D = D
         self.F2 = F2
@@ -217,23 +202,32 @@ class EEGTCNetSpectral(BaseModel):
         self.classes_: np.ndarray | None = None
         self._n_classes: int | None = None
 
-        # CHANGE: pass PCA config down to the preprocessor
+        # Preprocessor (will be fitted during training)
         self.preprocessor = ECoGPreprocessor(
             use_spectral=True,
             bands=self.bands,
             include_raw=include_raw,
-            n_pca_components=self.n_pca_components,                       # CHANGE
         )
 
-        # CHANGE: DON'T build SpatialBlock yet (we don't know post-PCA channel count until fit())
-        self.n_input_features: Optional[int] = None                       # CHANGE
-        self.spatial_block: Optional[SpatialBlock] = None                 # CHANGE
+        # Calculate input feature size
+        n_bands = len(self.bands) + (1 if include_raw else 0)
+        self.n_input_features = n_channels * n_bands
 
-        # TCN blocks (independent of input channel count)
+        # Spatial block
+        self.spatial_block = SpatialBlock(
+            n_input_features=self.n_input_features,
+            n_channels=n_channels,
+            F1=F1,
+            D=D,
+            F2=F2,
+            dropout=dropout,
+        )
+
+        # TCN blocks
         self.tcn_blocks = nn.ModuleList()
         in_ch = F2
         for i in range(tcn_layers):
-            dilation = 2**i
+            dilation = 2 ** i
             self.tcn_blocks.append(
                 TCNBlock(
                     in_channels=in_ch,
@@ -245,26 +239,11 @@ class EEGTCNetSpectral(BaseModel):
             )
             in_ch = tcn_channels
 
+        # Classifier
         self.classifier: nn.Linear | None = None
 
         # Feature buffer for streaming
         self._feature_buffer: torch.Tensor | None = None
-
-    # CHANGE: helper to build spatial block once we know post-PCA channel count + feature size
-    def _build_spatial_block(self) -> None:                               # CHANGE
-        out_ch = self.preprocessor.n_out_channels                          # post-PCA channels
-        n_bands = len(self.bands) + (1 if self.include_raw else 0)
-        self.n_channels = int(out_ch)                                      # CHANGE: model now operates on post-PCA channels
-        self.n_input_features = int(out_ch * n_bands)
-
-        self.spatial_block = SpatialBlock(
-            n_input_features=self.n_input_features,
-            n_channels=int(out_ch),
-            F1=self.F1,
-            D=self.D,
-            F2=self.F2,
-            dropout=self.dropout_rate,
-        )
 
     def _build_classifier(self, n_classes: int) -> None:
         self._n_classes = n_classes
@@ -281,25 +260,22 @@ class EEGTCNetSpectral(BaseModel):
             (batch, seq_len, n_classes)
         """
         if self.classifier is None:
-            raise RuntimeError("Model not initialized (classifier missing).")
-        if self.spatial_block is None or self.n_input_features is None:     # CHANGE
-            raise RuntimeError("Spatial block not initialized. Call fit_model() first.")
+            raise RuntimeError("Model not initialized")
 
         batch_size, seq_len, n_features = x.shape
-        if n_features != self.n_input_features:                             # CHANGE: clearer error if wiring is wrong
-            raise ValueError(
-                f"Expected n_features={self.n_input_features}, got {n_features}. "
-                "Did you change PCA/bands/include_raw without rebuilding the model?"
-            )
 
+        # Apply spatial block to each timestep
         x = x.reshape(-1, n_features)
         x = self.spatial_block(x)  # (batch*seq_len, F2)
 
+        # Reshape for TCN: (batch, F2, seq_len)
         x = x.reshape(batch_size, seq_len, -1).permute(0, 2, 1)
 
+        # TCN blocks
         for tcn_block in self.tcn_blocks:
             x = tcn_block(x)
 
+        # Classify: (batch, seq_len, n_classes)
         x = x.permute(0, 2, 1)
         return self.classifier(x)
 
@@ -308,38 +284,39 @@ class EEGTCNetSpectral(BaseModel):
         Predict for a single sample (streaming mode).
 
         Args:
-            X: Raw sample of shape (raw_n_channels,)
+            X: Raw sample of shape (n_channels,)
 
         Returns:
             Predicted label
         """
         if self.classes_ is None or self.classifier is None:
             raise RuntimeError("Model not trained")
-        if self.spatial_block is None or self.n_input_features is None:     # CHANGE
-            raise RuntimeError("Spatial block not initialized. Did you load/fit the model?")
 
         self.eval()
         with torch.no_grad():
-            # Preprocess (includes PCA if enabled + spectral features)
+            # Preprocess (extracts spectral features)
             features = self.preprocessor.transform_sample(X)
-            if features.shape[0] != self.n_input_features:                  # CHANGE
-                raise ValueError(
-                    f"Preprocessor returned {features.shape[0]} features, expected {self.n_input_features}."
-                )
-            features_t = torch.tensor(features, dtype=torch.float32)
+            features = torch.tensor(features, dtype=torch.float32)
 
-            spatial_out = self.spatial_block(features_t.unsqueeze(0))  # (1, F2)
+            # Spatial features
+            spatial_out = self.spatial_block(features.unsqueeze(0))  # (1, F2)
 
+            # Update buffer
             if self._feature_buffer is None:
                 self._feature_buffer = spatial_out.repeat(self.context_window, 1)
             else:
-                self._feature_buffer = torch.cat([self._feature_buffer[1:], spatial_out], dim=0)
+                self._feature_buffer = torch.cat([
+                    self._feature_buffer[1:],
+                    spatial_out
+                ], dim=0)
 
+            # TCN on buffer: (1, F2, context_window)
             x = self._feature_buffer.unsqueeze(0).permute(0, 2, 1)
 
             for tcn_block in self.tcn_blocks:
                 x = tcn_block(x)
 
+            # Classify last timestep
             x = x[:, :, -1]
             logits = self.classifier(x)
             pred_idx = int(torch.argmax(logits, dim=1).item())
@@ -347,6 +324,7 @@ class EEGTCNetSpectral(BaseModel):
         return int(self.classes_[pred_idx])
 
     def reset_buffer(self) -> None:
+        """Reset streaming state."""
         self._feature_buffer = None
         self.preprocessor.reset_streaming()
 
@@ -364,25 +342,11 @@ class EEGTCNetSpectral(BaseModel):
     ) -> None:
         """Train the model."""
 
-        logger.info("Fitting preprocessor (norm + optional PCA + spectral)...")  # CHANGE
+        # Fit preprocessor and transform training data
+        logger.info("Extracting spectral features...")
         self.preprocessor.fit(X)
-
-        # CHANGE: now that preprocessor is fitted, build spatial block using post-PCA dimensionality
-        self._build_spatial_block()                                              # CHANGE
-        assert self.spatial_block is not None and self.n_input_features is not None
-
-        logger.info(
-            f"Channels: raw={self.raw_n_channels} -> out={self.preprocessor.n_out_channels} "
-            f"(PCA={'on' if self.preprocessor.pca is not None else 'off'})"
-        )  # CHANGE
-
-        logger.info("Extracting features...")
         X_features = self.preprocessor.transform(X)
         logger.info(f"Feature shape: {X_features.shape} (raw: {X.shape})")
-        if X_features.shape[1] != self.n_input_features:                           # CHANGE
-            raise RuntimeError(
-                f"Feature dim mismatch: got {X_features.shape[1]} but model expects {self.n_input_features}"
-            )
 
         # Setup classes
         self.classes_ = np.unique(y)
@@ -408,36 +372,47 @@ class EEGTCNetSpectral(BaseModel):
         n_sequences = (n_samples - seq_len) // (seq_len // 2)
 
         self.train()
-        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=epochs, eta_min=learning_rate / 10
         )
 
-        best_loss = float("inf")
+        best_loss = float('inf')
         epoch_iter = tqdm(range(epochs), desc="Training", disable=not verbose)
 
-        for _epoch in epoch_iter:
+        for epoch in epoch_iter:
             total_loss = 0.0
             n_batches = 0
 
             starts = np.random.permutation(n_samples - seq_len)[:n_sequences]
 
             for batch_start in range(0, len(starts), batch_size):
-                batch_indices = starts[batch_start : batch_start + batch_size]
+                batch_indices = starts[batch_start:batch_start + batch_size]
 
-                X_batch = torch.stack([X_tensor[i : i + seq_len] for i in batch_indices])
-                y_batch = torch.stack([y_tensor[i : i + seq_len] for i in batch_indices])
+                X_batch = torch.stack([
+                    X_tensor[i:i + seq_len] for i in batch_indices
+                ])
+                y_batch = torch.stack([
+                    y_tensor[i:i + seq_len] for i in batch_indices
+                ])
 
                 optimizer.zero_grad()
                 logits = self.forward(X_batch)
-                loss = criterion(logits.reshape(-1, n_classes), y_batch.reshape(-1))
+                loss = criterion(
+                    logits.reshape(-1, n_classes),
+                    y_batch.reshape(-1)
+                )
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                 optimizer.step()
 
-                total_loss += float(loss.item())
+                total_loss += loss.item()
                 n_batches += 1
 
             scheduler.step()
@@ -455,17 +430,11 @@ class EEGTCNetSpectral(BaseModel):
         if self.classes_ is None:
             raise RuntimeError("Cannot save untrained model")
 
-        if self.spatial_block is None or self.n_input_features is None:          # CHANGE
-            raise RuntimeError("Cannot save before spatial block is built (call fit_model first).")
-
         checkpoint = {
             "config": {
-                # CHANGE: save both raw and post-PCA channel counts
-                "raw_n_channels": self.raw_n_channels,                           # CHANGE
-                "n_channels": self.n_channels,                                   # post-PCA (after fit)   # CHANGE
+                "n_channels": self.n_channels,
                 "bands": self.bands,
                 "include_raw": self.include_raw,
-                "n_pca_components": self.n_pca_components,                       # CHANGE
                 "F1": self.F1,
                 "D": self.D,
                 "F2": self.F2,
@@ -478,8 +447,10 @@ class EEGTCNetSpectral(BaseModel):
             },
             "classes": self.classes_,
             "state_dict": self.state_dict(),
-            # CHANGE: save full preprocessor state (includes PCA matrices + stats)
-            "preprocessor_state": self.preprocessor.get_state(),                 # CHANGE
+            "preprocessor": {
+                "mean": self.preprocessor.mean,
+                "std": self.preprocessor.std,
+            },
         }
 
         torch.save(checkpoint, MODEL_PATH)
@@ -495,12 +466,10 @@ class EEGTCNetSpectral(BaseModel):
         checkpoint = torch.load(MODEL_PATH, weights_only=False)
         config = checkpoint["config"]
 
-        # CHANGE: initialize with raw_n_channels (preprocessor will handle PCA)
         model = cls(
-            n_channels=config.get("raw_n_channels", config["n_channels"]),       # CHANGE
+            n_channels=config["n_channels"],
             bands=config["bands"],
             include_raw=config["include_raw"],
-            n_pca_components=config.get("n_pca_components", 64),                 # CHANGE
             F1=config["F1"],
             D=config["D"],
             F2=config["F2"],
@@ -511,16 +480,18 @@ class EEGTCNetSpectral(BaseModel):
             context_window=config["context_window"],
         )
 
-        # CHANGE: restore preprocessor fully (including PCA) BEFORE building SpatialBlock
-        model.preprocessor.set_state(checkpoint["preprocessor_state"])            # CHANGE
-
-        # CHANGE: now we can build spatial block with correct post-PCA dimensionality
-        model._build_spatial_block()                                              # CHANGE
-
         model._build_classifier(config["n_classes"])
         model.classes_ = checkpoint["classes"]
         model.load_state_dict(checkpoint["state_dict"])
 
+        # Restore preprocessor state
+        model.preprocessor.mean = checkpoint["preprocessor"]["mean"]
+        model.preprocessor.std = checkpoint["preprocessor"]["std"]
+        model.preprocessor._n_raw_channels = config["n_channels"]
+
         model.eval()
         logger.debug(f"Model loaded from {MODEL_PATH}")
         return model
+
+
+        
