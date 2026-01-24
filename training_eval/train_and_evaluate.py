@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Evaluation Script
+Train and evaluate script
 
-This script evaluates a pre-trained model (trained on OSCAR cluster):
-    1. Downloading ECoG data from Hugging Face (if not already downloaded)
-    2. Loading validation data
-    3. Loading the pre-trained model
-    4. Running inference and computing evaluation metrics
-    5. Displaying results
+This script demonstrates a local train+evaluate workflow for the EEG-TCNet
+spectral model. It will:
+    1. Download formatted ECoG data (if missing)
+    2. Load training and validation splits
+    3. Train an EEG-TCNet (spectral) model while printing loss progress
+    4. Save the trained model and metadata
+    5. Run evaluation on the validation set and print a summary
 
 Usage:
     python training_eval/train_and_evaluate.py
 
-Assumes the model is already trained and saved to model.pt in the repository root.
+The trained model is saved to `model.pt` in the repository root and metadata is
+written to `model_metadata.json` so the evaluator can load it.
 """
 
 from pathlib import Path
@@ -33,18 +35,19 @@ from brainstorm.ml.eeg_tcnet_spectral import EEGTCNetSpectral
 # Path to the formatted data directory
 DATA_PATH = Path("./data")
 
-# Path to the trained model
+# Training hyperparameters (small defaults so script runs quickly)
+EPOCHS = 30
+BATCH_SIZE = 32
+SEQ_LEN = 64
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+
+# Path to the trained model (used for informational messages)
 MODEL_PATH = Path("./model.pt")
 
 
 def main() -> None:
-    rprint("\n[bold green]Evaluating Pre-trained Model...[/]\n")
-
-    # Check if model exists
-    if not MODEL_PATH.exists():
-        rprint(f"\n[bold red]Error: Model not found at {MODEL_PATH}[/]")
-        rprint("[bold yellow]Please ensure the model is trained and saved first.[/]\n")
-        return
+    rprint("\n[bold green]Train and evaluate EEG-TCNet (spectral)...[/]\n")
 
     # Download data if not already present
     if not DATA_PATH.exists() or not any(DATA_PATH.glob("*.parquet")):
@@ -52,7 +55,8 @@ def main() -> None:
         download_train_validation_data()
         rprint("[bold green]✓ Data downloaded successfully![/]\n")
 
-    rprint(f"\n[bold cyan]Loading validation data from:[/] {DATA_PATH}\n")
+    rprint(f"\n[bold cyan]Loading data from:[/] {DATA_PATH}\n")
+    train_features, train_labels = load_raw_data(DATA_PATH, step="train")
     validation_features, validation_labels = load_raw_data(DATA_PATH, step="validation")
 
     # Create a nice table to display dataset information
@@ -67,7 +71,14 @@ def main() -> None:
     table.add_column("Time Range (s)", style="yellow")
     table.add_column("Unique Labels", style="blue")
 
-    # Add validation data row
+    # Add training and validation rows
+    table.add_row(
+        "Train",
+        str(train_features.shape),
+        str(train_labels.shape),
+        f"{train_features.index[0]:.2f} → {train_features.index[-1]:.2f}",
+        str(sorted(train_labels["label"].unique().tolist())),
+    )
     table.add_row(
         "Validation",
         str(validation_features.shape),
@@ -79,38 +90,30 @@ def main() -> None:
     console.print(table)
     print()
 
-    # Load pre-trained model
-    rprint("\n[bold green]Loading pre-trained model...[/]\n")
-    try:
-        model = EEGTCNetSpectral.load()
-        rprint(f"[bold green]✓ Model loaded successfully from {MODEL_PATH}[/]\n")
-    except Exception as e:
-        rprint(f"\n[bold red]Error loading model: {e}[/]\n")
-        return
+    # Train model
+    rprint("\n[bold green]Training EEG-TCNet (spectral)...[/]\n")
+    model = EEGTCNetSpectral()
 
-    # Display model configuration
-    config_table = Table(
-        title="Model Configuration", show_header=True, header_style="bold magenta"
+    # If a model file exists, inform the user it will be overwritten by this run
+    if MODEL_PATH.exists():
+        rprint(f"[bold yellow]Note: existing model at {MODEL_PATH} will be overwritten by training.[/]")
+
+    # Call the high-level fit() which will run fit_model(), save the model, and write metadata
+    model.fit(
+        X=train_features.values,
+        y=train_labels["label"].values,  # type: ignore[union-attr]
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        seq_len=SEQ_LEN,
+        learning_rate=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        verbose=True,
     )
-    config_table.add_column("Parameter", style="cyan")
-    config_table.add_column("Value", style="green")
-    config_table.add_row("Frequency Bands", str(list(model.bands.keys())))
-    config_table.add_row("Include Raw Signal", str(model.include_raw))
-    config_table.add_row("Spatial Block F1", str(model.F1))
-    config_table.add_row("Spatial Block D", str(model.D))
-    config_table.add_row("Spatial Block F2", str(model.F2))
-    config_table.add_row("TCN Layers", str(model.tcn_layers))
-    config_table.add_row("TCN Channels", str(model.tcn_channels))
-    config_table.add_row("Context Window", str(model.context_window))
-    config_table.add_row("Dropout", str(model.dropout_rate))
-    config_table.add_row("Number of Classes", str(len(model.classes_) if model.classes_ is not None else "N/A"))
-    console.print(config_table)
-    print()
 
-    # Evaluate model
+    rprint("\n[bold green]Training finished. Proceeding to evaluation...[/]\n")
+
+    # Evaluate model on the validation set. ModelEvaluator will load the model using metadata written by BaseModel.fit()
     rprint("\n[bold green]Evaluating model on validation set...[/]\n")
-    # NOTE: we use validation_features and labels because the test set is held out
-    # and not accessible for local evaluation.
     evaluator = ModelEvaluator(
         test_features=validation_features,
         test_labels=validation_labels[["label"]],  # type: ignore[union-attr]
@@ -119,7 +122,7 @@ def main() -> None:
     metrics = evaluator.evaluate()
     evaluator.print_summary(metrics)
 
-    rprint("\n[bold green]Evaluation complete![/]\n")
+    rprint("\n[bold green]Train+Evaluation complete![/]\n")
 
 
 if __name__ == "__main__":
