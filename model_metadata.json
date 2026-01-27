@@ -1,4 +1,4 @@
 {
-  "model_path": "cnn_gru.pt",
-  "import_string": "brainstorm.ml.cnn_gru.CNNGRU"
+  "model_path": "eegnet.pt",
+  "import_string": "brainstorm.ml.eegnet.EEGNet"
 }

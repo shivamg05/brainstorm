@@ -286,7 +286,7 @@ class EEGTCNet(BaseModel):
         # General
         dropout: float = 0.3,
         # Context window for TCN (in samples)
-        context_window: int = 96,
+        context_window: int = 1000,
         use_mask: bool = True,
     ):
         super().__init__()
@@ -471,7 +471,7 @@ class EEGTCNet(BaseModel):
         y: np.ndarray,
         epochs: int = 30,
         batch_size: int = 32,
-        seq_len: int = 96,
+        seq_len: int = 1000,
         stride: int | None = None,
         chunk_len: int | None = None,
         chunks_per_epoch: int = 4,
@@ -522,7 +522,7 @@ class EEGTCNet(BaseModel):
 
         # Create sequences for training
         n_samples = len(X)
-        stride = stride or (seq_len * 3 // 4)
+        stride = stride or (seq_len)
         if chunk_len is not None:
             if chunk_len <= seq_len:
                 raise ValueError("chunk_len must be greater than seq_len")
