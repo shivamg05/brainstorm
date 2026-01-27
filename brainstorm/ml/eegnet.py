@@ -189,6 +189,12 @@ class EEGNet(BaseModel):
             dataset, batch_size=batch_size, shuffle=True
         )
 
+        device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
+        self.to(device)
         self.train()
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -202,7 +208,7 @@ class EEGNet(BaseModel):
             class_weights = class_counts.sum() / class_counts
             class_weights = class_weights / class_weights.mean()
             criterion = nn.CrossEntropyLoss(
-                weight=torch.tensor(class_weights, dtype=torch.float32)
+                weight=torch.tensor(class_weights, dtype=torch.float32).to(device)
             )
         else:
             criterion = nn.CrossEntropyLoss()
@@ -216,6 +222,8 @@ class EEGNet(BaseModel):
             total = 0
 
             for X_batch, y_batch in loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.to(device)
                 optimizer.zero_grad()
                 logits = self.forward(X_batch)
                 loss = criterion(logits, y_batch)
@@ -261,6 +269,7 @@ class EEGNet(BaseModel):
                     val_acc,
                 )
 
+        self.to("cpu")
         self.eval()
         logger.info(f"Training complete. Best loss: {best_loss:.4f}")
 
