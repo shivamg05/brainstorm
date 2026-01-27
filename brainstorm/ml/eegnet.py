@@ -292,6 +292,7 @@ class EEGNet(BaseModel):
     def predict(self, X: np.ndarray) -> int:
         if self.classes_ is None or self._stats is None:
             raise RuntimeError("Model not trained. Call fit() first or load a trained model.")
+        device = next(self.parameters()).device
         x = np.asarray(X, dtype=np.float32)
         if x.shape != (self.raw_channels,):
             raise ValueError(f"Expected input shape ({self.raw_channels},), got {x.shape}")
@@ -313,7 +314,12 @@ class EEGNet(BaseModel):
             self._buffer = np.concatenate([self._buffer[1:], x_proj[None, :]], axis=0)
 
         window = self._buffer
-        x_tensor = torch.tensor(window.T, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        x_tensor = (
+            torch.tensor(window.T, dtype=torch.float32)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(device)
+        )
         self.eval()
         with torch.no_grad():
             logits = self.forward(x_tensor)
