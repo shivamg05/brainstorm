@@ -138,6 +138,7 @@ class EEGNet(BaseModel):
         batch_size: int = 64,
         stride: int = 1,
         class_weighted: bool = True,
+        balanced_sampling: bool = True,
         materialize_windows: bool = False,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
@@ -186,8 +187,22 @@ class EEGNet(BaseModel):
             )
             stride_step = max(1, stride)
             labels = y_indices[self.window_samples - 1 :: stride_step]
+        sampler = None
+        if balanced_sampling:
+            sample_counts = np.bincount(labels, minlength=n_classes).astype(np.float32)
+            sample_counts = np.maximum(sample_counts, 1.0)
+            sample_weights = 1.0 / sample_counts[labels]
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=torch.tensor(sample_weights, dtype=torch.float32),
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+
         loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True
+            dataset,
+            batch_size=batch_size,
+            shuffle=not balanced_sampling,
+            sampler=sampler,
         )
 
         device = torch.device(

@@ -85,6 +85,7 @@ def main() -> None:
         stride=STRIDE,
         learning_rate=LEARNING_RATE,
         class_weighted=CLASS_WEIGHTED,
+        balanced_sampling=True,
         materialize_windows=MATERIALIZE_WINDOWS,
         X_val=val_features.to_numpy(),
         y_val=val_labels["label"].to_numpy(),  # type: ignore[union-attr]
