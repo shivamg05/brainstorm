@@ -7,6 +7,7 @@ Usage:
 """
 
 from pathlib import Path
+import shutil
 
 from rich import print as rprint
 from rich.console import Console
@@ -25,14 +26,17 @@ from brainstorm.ml.eegnet import EEGNet
 DATA_PATH = Path("./data")
 
 EPOCHS = 30
-BATCH_SIZE = 64
-WINDOW_SAMPLES = 512
+BATCH_SIZE = 16
+WINDOW_SAMPLES = 1600
 STRIDE = 1
 LEARNING_RATE = 1e-3
 CLASS_WEIGHTED = True
-VAL_EVERY = 3
+VAL_EVERY = 1
 VAL_MAX_SAMPLES = None
 MATERIALIZE_WINDOWS = True
+BALANCED_SAMPLING = False
+PCA_COMPONENTS = 32
+D_VALUE = 1
 
 
 def _print_dataset_table(train_features, train_labels, val_features, val_labels) -> None:
@@ -76,7 +80,11 @@ def main() -> None:
     _print_dataset_table(train_features, train_labels, val_features, val_labels)
 
     rprint("\n[bold green]Training model...[/]\n")
-    model = EEGNet(window_samples=WINDOW_SAMPLES, pca_components=64)
+    model = EEGNet(
+        window_samples=WINDOW_SAMPLES,
+        pca_components=PCA_COMPONENTS,
+        D=D_VALUE,
+    )
     model.fit(
         X=train_features.to_numpy(),
         y=train_labels["label"].to_numpy(),  # type: ignore[union-attr]
@@ -85,7 +93,7 @@ def main() -> None:
         stride=STRIDE,
         learning_rate=LEARNING_RATE,
         class_weighted=CLASS_WEIGHTED,
-        balanced_sampling=True,
+        balanced_sampling=BALANCED_SAMPLING,
         materialize_windows=MATERIALIZE_WINDOWS,
         X_val=val_features.to_numpy(),
         y_val=val_labels["label"].to_numpy(),  # type: ignore[union-attr]
@@ -94,6 +102,19 @@ def main() -> None:
         log_epoch_metrics=True,
         verbose=True,
     )
+
+    best_checkpoint = Path("checkpoints/eegnet_best.pt")
+    if best_checkpoint.exists():
+        shutil.copyfile(best_checkpoint, Path("eegnet.pt"))
+        rprint(f"[bold green]Using best checkpoint:[/] {best_checkpoint}")
+        best_model = EEGNet.load()
+        val_bal = best_model._evaluate_windowed_accuracy(
+            val_features.to_numpy(),
+            val_labels["label"].to_numpy(),  # type: ignore[union-attr]
+            batch_size=BATCH_SIZE,
+            max_samples=VAL_MAX_SAMPLES,
+        )
+        rprint(f"[bold cyan]Windowed val balanced acc:[/] {val_bal:.3f}")
 
     rprint("\n[bold green]Evaluating model on validation set...[/]\n")
     evaluator = ModelEvaluator(
