@@ -184,6 +184,8 @@ class EEGNet(BaseModel):
                 window_samples=self.window_samples,
                 stride=stride,
             )
+            stride_step = max(1, stride)
+            labels = y_indices[self.window_samples - 1 :: stride_step]
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True
         )
@@ -202,7 +204,7 @@ class EEGNet(BaseModel):
             optimizer, T_max=epochs, eta_min=learning_rate / 10
         )
         if class_weighted:
-            class_counts = np.bincount(y_indices, minlength=n_classes).astype(np.float32)
+            class_counts = np.bincount(labels, minlength=n_classes).astype(np.float32)
             class_counts = np.maximum(class_counts, 1.0)
             class_weights = 1.0 / class_counts
             class_weights = class_weights / class_weights.sum() * n_classes

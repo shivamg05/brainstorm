@@ -17,7 +17,7 @@ from rich import print as rprint
 
 from brainstorm.download import download_train_validation_data
 from brainstorm.loading import load_raw_data
-from brainstorm.ml.cnn_gru import CNNGRU
+from brainstorm.ml.eegnet import EEGNet
 
 
 DATA_PATH = Path("./data")
@@ -41,7 +41,7 @@ def main() -> None:
     train_features, train_labels = load_raw_data(DATA_PATH, step="train")
     val_features, val_labels = load_raw_data(DATA_PATH, step="validation")
     y_val = val_labels["label"].to_numpy()
-    model = CNNGRU.load()
+    model = EEGNet.load()
 
     preds = []
     for sample in val_features.to_numpy():
