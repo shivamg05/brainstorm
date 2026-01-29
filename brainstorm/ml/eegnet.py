@@ -8,7 +8,6 @@ sliding window. Uses PCA to reduce channels before windowing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Self
 
@@ -27,12 +26,8 @@ from brainstorm.ml.base import BaseModel
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 MODEL_PATH = _REPO_ROOT / "eegnet.pt"
-
-
-@dataclass(frozen=True)
-class NormalizerStats:
-    mean: np.ndarray
-    std: np.ndarray
+CHECKPOINT_DIR = _REPO_ROOT / "checkpoints"
+BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "eegnet_best.pt"
 
 
 class EEGNet(BaseModel):
@@ -63,7 +58,6 @@ class EEGNet(BaseModel):
 
         self.classes_: np.ndarray | None = None
         self._n_classes: int | None = None
-        self._stats: NormalizerStats | None = None
         self._buffer: np.ndarray | None = None
         self._pca_components: np.ndarray | None = None
         self._pca_mean: np.ndarray | None = None
@@ -144,6 +138,7 @@ class EEGNet(BaseModel):
         batch_size: int = 64,
         stride: int = 1,
         class_weighted: bool = True,
+        materialize_windows: bool = False,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         verbose: bool = True,
@@ -161,30 +156,34 @@ class EEGNet(BaseModel):
         self._build_classifier(n_classes)
 
         X = np.asarray(X, dtype=np.float32)
-        X_car = X - X.mean(axis=1, keepdims=True)
         if self.pca_components is not None:
             pca = PCA(n_components=self.pca_components, random_state=42)
-            X_proj = pca.fit_transform(X_car)
+            X_proj = pca.fit_transform(X)
             self._pca_components = pca.components_.astype(np.float32)
             self._pca_mean = pca.mean_.astype(np.float32)
         else:
-            X_proj = X_car
-
-        stats = NormalizerStats(
-            mean=X_proj.mean(axis=0, keepdims=True),
-            std=X_proj.std(axis=0, keepdims=True) + 1e-6,
-        )
-        self._stats = stats
-
-        X_norm = (X_proj - stats.mean) / stats.std
+            X_proj = X
         y_indices = np.array([class_to_idx[label] for label in y], dtype=np.int64)
 
-        dataset = _EEGNetWindowDataset(
-            X_norm,
-            y_indices,
-            window_samples=self.window_samples,
-            stride=stride,
-        )
+        if materialize_windows:
+            windows = np.lib.stride_tricks.sliding_window_view(
+                X_proj, self.window_samples, axis=0
+            )
+            windows = windows.reshape(-1, self.window_samples, self.n_channels)
+            stride_step = max(1, stride)
+            windows = windows[::stride_step]
+            labels = y_indices[self.window_samples - 1 :: stride_step]
+            X_tensor = torch.tensor(np.ascontiguousarray(windows), dtype=torch.float32)
+            X_tensor = X_tensor.permute(0, 2, 1).unsqueeze(1)
+            y_tensor = torch.tensor(labels, dtype=torch.long)
+            dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+        else:
+            dataset = _EEGNetWindowDataset(
+                X_proj,
+                y_indices,
+                window_samples=self.window_samples,
+                stride=stride,
+            )
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True
         )
@@ -205,8 +204,8 @@ class EEGNet(BaseModel):
         if class_weighted:
             class_counts = np.bincount(y_indices, minlength=n_classes).astype(np.float32)
             class_counts = np.maximum(class_counts, 1.0)
-            class_weights = class_counts.sum() / class_counts
-            class_weights = class_weights / class_weights.mean()
+            class_weights = 1.0 / class_counts
+            class_weights = class_weights / class_weights.sum() * n_classes
             criterion = nn.CrossEntropyLoss(
                 weight=torch.tensor(class_weights, dtype=torch.float32).to(device)
             )
@@ -214,6 +213,8 @@ class EEGNet(BaseModel):
             criterion = nn.CrossEntropyLoss()
 
         best_loss = float("inf")
+        best_val_acc = None
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         epoch_iterator = tqdm(range(epochs), desc="Training", disable=not verbose)
         for epoch in epoch_iterator:
             total_loss = 0.0
@@ -259,9 +260,34 @@ class EEGNet(BaseModel):
                 and y_val is not None
                 and (epoch + 1) % eval_every == 0
             ):
-                val_acc = self._evaluate_streaming_accuracy(
-                    X_val, y_val, max_samples=eval_max_samples
+                val_acc = self._evaluate_windowed_accuracy(
+                    X_val, y_val, batch_size=batch_size, max_samples=eval_max_samples
                 )
+                if best_val_acc is None or val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    checkpoint = {
+                        "config": {
+                            "n_channels": self.raw_channels,
+                            "window_samples": self.window_samples,
+                            "temporal_kernel": self.temporal_kernel,
+                            "F1": self.F1,
+                            "D": self.D,
+                            "dropout": self.dropout_rate,
+                            "pool1": self.pool1,
+                            "pool2": self.pool2,
+                            "pca_components": self.pca_components,
+                            "n_classes": self._n_classes,
+                        },
+                        "classes": self.classes_,
+                        "state_dict": self.state_dict(),
+                        "pca": {
+                            "components": self._pca_components,
+                            "mean": self._pca_mean,
+                        },
+                        "epoch": epoch + 1,
+                        "val_bal_acc": val_acc,
+                    }
+                    torch.save(checkpoint, BEST_CHECKPOINT_PATH)
                 logger.info(
                     "Epoch {}/{} - val balanced acc={:.3f}",
                     epoch + 1,
@@ -273,39 +299,66 @@ class EEGNet(BaseModel):
         self.eval()
         logger.info(f"Training complete. Best loss: {best_loss:.4f}")
 
-    def _evaluate_streaming_accuracy(
+    def _evaluate_windowed_accuracy(
         self,
         X_val: np.ndarray,
         y_val: np.ndarray,
+        batch_size: int,
         max_samples: int | None = None,
     ) -> float:
         if X_val.shape[0] != y_val.shape[0]:
             raise ValueError("X_val and y_val must have the same length")
+        device = next(self.parameters()).device
         n_eval = X_val.shape[0] if max_samples is None else min(X_val.shape[0], max_samples)
-        self.reset_state()
-        preds = []
-        for i in range(n_eval):
-            preds.append(self.predict(X_val[i]))
-        y_true = y_val[:n_eval].reshape(-1)
-        return float(balanced_accuracy_score(y_true, np.array(preds)))
+        X_val = np.asarray(X_val[:n_eval], dtype=np.float32)
+        y_val = np.asarray(y_val[:n_eval]).reshape(-1)
+        class_to_idx = {c: i for i, c in enumerate(self.classes_)}
+        y_indices = np.array([class_to_idx[label] for label in y_val], dtype=np.int64)
+
+        if self.pca_components is not None:
+            if self._pca_components is None or self._pca_mean is None:
+                raise RuntimeError("PCA not initialized.")
+            X_proj = (X_val - self._pca_mean) @ self._pca_components.T
+        else:
+            X_proj = X_val
+
+        dataset = _EEGNetWindowDataset(
+            X_proj,
+            y_indices,
+            window_samples=self.window_samples,
+            stride=1,
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=False
+        )
+
+        self.eval()
+        all_preds: list[int] = []
+        all_labels: list[int] = []
+        with torch.no_grad():
+            for X_batch, y_batch in loader:
+                X_batch = X_batch.to(device)
+                logits = self.forward(X_batch)
+                preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+                all_preds.extend(preds)
+                all_labels.extend(y_batch.numpy().tolist())
+
+        return float(balanced_accuracy_score(all_labels, all_preds))
 
     def predict(self, X: np.ndarray) -> int:
-        if self.classes_ is None or self._stats is None:
+        if self.classes_ is None:
             raise RuntimeError("Model not trained. Call fit() first or load a trained model.")
         device = next(self.parameters()).device
         x = np.asarray(X, dtype=np.float32)
         if x.shape != (self.raw_channels,):
             raise ValueError(f"Expected input shape ({self.raw_channels},), got {x.shape}")
 
-        x = x - x.mean()
         if self.pca_components is not None:
             if self._pca_components is None or self._pca_mean is None:
                 raise RuntimeError("PCA not initialized.")
             x_proj = (x - self._pca_mean) @ self._pca_components.T
         else:
             x_proj = x
-
-        x_proj = (x_proj - self._stats.mean[0]) / self._stats.std[0]
 
         if self._buffer is None:
             pad = np.zeros((self.window_samples - 1, self.n_channels), dtype=np.float32)
@@ -330,7 +383,7 @@ class EEGNet(BaseModel):
         self._buffer = None
 
     def save(self) -> Path:
-        if self.classes_ is None or self._stats is None:
+        if self.classes_ is None:
             raise RuntimeError("Cannot save untrained model. Call fit() first.")
         checkpoint = {
             "config": {
@@ -347,7 +400,6 @@ class EEGNet(BaseModel):
             },
             "classes": self.classes_,
             "state_dict": self.state_dict(),
-            "stats": {"mean": self._stats.mean, "std": self._stats.std},
             "pca": {
                 "components": self._pca_components,
                 "mean": self._pca_mean,
@@ -377,9 +429,6 @@ class EEGNet(BaseModel):
         model._build_classifier(config["n_classes"])
         model.classes_ = checkpoint["classes"]
         model.load_state_dict(checkpoint["state_dict"])
-        model._stats = NormalizerStats(
-            mean=checkpoint["stats"]["mean"], std=checkpoint["stats"]["std"]
-        )
         pca_state = checkpoint.get("pca", {})
         model._pca_components = pca_state.get("components")
         model._pca_mean = pca_state.get("mean")

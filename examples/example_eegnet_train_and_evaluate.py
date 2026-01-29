@@ -30,8 +30,9 @@ WINDOW_SAMPLES = 512
 STRIDE = 1
 LEARNING_RATE = 1e-3
 CLASS_WEIGHTED = True
-VAL_EVERY = 7
+VAL_EVERY = 3
 VAL_MAX_SAMPLES = None
+MATERIALIZE_WINDOWS = True
 
 
 def _print_dataset_table(train_features, train_labels, val_features, val_labels) -> None:
@@ -84,6 +85,7 @@ def main() -> None:
         stride=STRIDE,
         learning_rate=LEARNING_RATE,
         class_weighted=CLASS_WEIGHTED,
+        materialize_windows=MATERIALIZE_WINDOWS,
         X_val=val_features.to_numpy(),
         y_val=val_labels["label"].to_numpy(),  # type: ignore[union-attr]
         eval_every=VAL_EVERY,
